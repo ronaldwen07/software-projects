@@ -1,1 +1,315 @@
+# PDF Q&A Chatbot with Gradio
+# A document assistant that answers questions about uploaded PDFs
 
+# Step 1: Uninstall and reinstall Gradio cleanly
+!pip uninstall gradio -y -q
+!pip install gradio==4.36.1 pypdf2 -q
+
+
+# PDF Q&A Chatbot with Gradio
+# Built following official Gradio chatbot documentation
+
+# Step 1: Install required packages
+!pip install gradio pypdf2 -q
+
+# Step 2: Import libraries
+import gradio as gr
+import PyPDF2
+import io
+from datetime import datetime
+import json
+
+print("✅ Libraries loaded successfully!")
+
+# Step 3: Global variable to store PDF content
+pdf_text_content = ""
+
+# Step 4: PDF Processing Function
+def process_pdf_upload(pdf_file):
+    """Process uploaded PDF and extract text"""
+    global pdf_text_content
+    
+    if pdf_file is None:
+        return "📤 No file uploaded", "0 pages"
+    
+    try:
+        # Read PDF from binary data
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_file))
+        
+        # Extract text from all pages
+        pdf_text_content = ""
+        for page in pdf_reader.pages:
+            pdf_text_content += page.extract_text() + "\n"
+        
+        # Get statistics
+        num_pages = len(pdf_reader.pages)
+        num_words = len(pdf_text_content.split())
+        
+        status = f"✅ Loaded: {num_pages} pages, ~{num_words} words"
+        info = f"{num_pages} pages | {num_words} words"
+        
+        return status, info
+        
+    except Exception as e:
+        pdf_text_content = ""
+        return f"❌ Error: {str(e)}", "Error"
+
+# Step 5: Chat Response Function (following Gradio chatbot pattern)
+def respond(message, chat_history, response_mode):
+    """
+    Generate response to user message
+    This follows the official Gradio chatbot pattern
+    """
+    global pdf_text_content
+    
+    # Check if PDF is loaded
+    if not pdf_text_content or pdf_text_content.strip() == "":
+        bot_message = "⚠️ Please upload a PDF document first before asking questions!"
+        chat_history.append((message, bot_message))
+        return "", chat_history
+    
+    # Check for empty message
+    if not message or message.strip() == "":
+        return "", chat_history
+    
+    # Process based on response mode
+    message_lower = message.lower()
+    
+    if response_mode == "Summary":
+        # Return document summary
+        words = pdf_text_content.split()
+        summary_length = min(200, len(words))
+        summary = ' '.join(words[:summary_length])
+        if len(words) > 200:
+            summary += "..."
+        bot_message = f"📄 **Document Summary:**\n\n{summary}"
+    
+    elif response_mode == "Detailed":
+        # Search for detailed relevant sections
+        sentences = [s.strip() for s in pdf_text_content.split('.') if s.strip() and len(s.strip()) > 20]
+        keywords = [w for w in message_lower.split() if len(w) > 3]
+        
+        relevant_sentences = []
+        for sentence in sentences:
+            if any(keyword in sentence.lower() for keyword in keywords):
+                relevant_sentences.append(sentence)
+        
+        if relevant_sentences:
+            detailed_response = '. '.join(relevant_sentences[:5])
+            if not detailed_response.endswith('.'):
+                detailed_response += '.'
+            bot_message = f"🔍 **Detailed Answer:**\n\n{detailed_response}"
+        else:
+            bot_message = "🔍 I couldn't find detailed information about that. Try:\n• Using different keywords\n• Asking a broader question\n• Switching to 'Summary' mode"
+    
+    else:  # Simple mode
+        # Quick answer with first relevant sentence
+        sentences = [s.strip() for s in pdf_text_content.split('.') if s.strip() and len(s.strip()) > 20]
+        keywords = [w for w in message_lower.split() if len(w) > 3]
+        
+        relevant_sentences = []
+        for sentence in sentences:
+            if any(keyword in sentence.lower() for keyword in keywords):
+                relevant_sentences.append(sentence)
+        
+        if relevant_sentences:
+            bot_message = f"💡 {relevant_sentences[0]}."
+        else:
+            bot_message = "💡 I couldn't find that specific information. Try:\n• Different keywords\n• More general questions\n• 'Summary' mode for an overview"
+    
+    # Add timestamp
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    bot_message += f"\n\n*Answered at {timestamp}*"
+    
+    # Append to chat history (message, response) tuple format
+    chat_history.append((message, bot_message))
+    
+    # Return empty string for textbox (clears it) and updated history
+    return "", chat_history
+
+# Step 6: Save Chat History Function
+def save_chat(chat_history):
+    """Save conversation to JSON file"""
+    if not chat_history or len(chat_history) == 0:
+        return "⚠️ No chat history to save"
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"chat_history_{timestamp}.json"
+    
+    conversation_data = {
+        "saved_at": datetime.now().isoformat(),
+        "total_messages": len(chat_history),
+        "conversation": [
+            {"question": user_msg, "answer": bot_msg} 
+            for user_msg, bot_msg in chat_history
+        ]
+    }
+    
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(conversation_data, f, indent=2, ensure_ascii=False)
+        return f"💾 Chat saved to: {filename}"
+    except Exception as e:
+        return f"❌ Error saving: {str(e)}"
+
+# Step 7: Clear All Function
+def clear_all():
+    """Reset everything"""
+    global pdf_text_content
+    pdf_text_content = ""
+    return None, "📤 Ready for new document", "0 pages", [], ""
+
+# Step 8: Build Gradio Interface using Blocks
+with gr.Blocks(theme=gr.themes.Soft(), title="PDF Q&A Assistant") as demo:
+    
+    gr.Markdown("""
+    # 📚 PDF Question & Answer Assistant
+    ### Upload a PDF document and ask questions about its content!
+    """)
+    
+    with gr.Row():
+        # Left Column - Upload and Controls
+        with gr.Column(scale=1):
+            gr.Markdown("### 📤 Document Upload")
+            
+            pdf_upload = gr.File(
+                label="Choose PDF File",
+                file_types=[".pdf"],
+                type="binary"
+            )
+            
+            upload_status = gr.Textbox(
+                label="Upload Status",
+                value="📤 Waiting for document...",
+                interactive=False
+            )
+            
+            doc_info = gr.Textbox(
+                label="Document Info",
+                value="0 pages",
+                interactive=False
+            )
+            
+            gr.Markdown("### ⚙️ Response Settings")
+            
+            mode_select = gr.Dropdown(
+                choices=["Simple", "Detailed", "Summary"],
+                value="Simple",
+                label="Response Mode",
+                info="Choose answer detail level"
+            )
+            
+            gr.Markdown("""
+            **Mode Guide:**
+            - **Simple**: Quick, direct answers
+            - **Detailed**: Comprehensive responses  
+            - **Summary**: Document overview
+            """)
+            
+            gr.Markdown("### 🛠️ Actions")
+            
+            with gr.Row():
+                clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
+                save_btn = gr.Button("💾 Save Chat", variant="primary")
+            
+            save_status = gr.Textbox(
+                label="Save Status",
+                interactive=False
+            )
+        
+        # Right Column - Chat Interface
+        with gr.Column(scale=2):
+            gr.Markdown("### 💬 Chat Interface")
+            
+            # Chatbot component (main chat display)
+            chatbot = gr.Chatbot(
+                label="Conversation",
+                height=450,
+                show_copy_button=True
+            )
+            
+            # Message input textbox
+            msg = gr.Textbox(
+                label="Your Question",
+                placeholder="Type your question here...",
+                lines=2,
+                show_label=True
+            )
+            
+            # Submit button
+            submit_btn = gr.Button("🚀 Ask Question", variant="primary")
+    
+    # Example Questions
+    gr.Markdown("### 💡 Example Questions")
+    gr.Examples(
+        examples=[
+            ["What is this document about?"],
+            ["Can you summarize the main points?"],
+            ["What are the key findings?"],
+            ["Tell me about the introduction"],
+            ["What methodology was used?"]
+        ],
+        inputs=msg
+    )
+    
+    # Footer
+    gr.Markdown("""
+    ---
+    ### 📌 Key Features:
+    
+    | Feature | Description |
+    |---------|-------------|
+    | 🔄 **Response Modes** | Simple, Detailed, or Summary answers |
+    | 📁 **PDF Support** | Upload and analyze any PDF document |
+    | 💾 **Save History** | Export conversations to JSON |
+    | 🎨 **Modern UI** | Clean, intuitive interface |
+    | ⌨️ **Shortcuts** | Press Enter to submit |
+    | 🕒 **Timestamps** | Track when answers were generated |
+    | 📋 **Copy Button** | Easily copy responses |
+    
+    ---
+    *Built with Gradio | Powered by PyPDF2*
+    """)
+    
+    # Event Handlers (following Gradio chatbot pattern)
+    
+    # File upload handler
+    pdf_upload.change(
+        fn=process_pdf_upload,
+        inputs=[pdf_upload],
+        outputs=[upload_status, doc_info]
+    )
+    
+    # Submit button click - uses respond function
+    submit_btn.click(
+        fn=respond,
+        inputs=[msg, chatbot, mode_select],
+        outputs=[msg, chatbot]
+    )
+    
+    # Enter key press - uses respond function
+    msg.submit(
+        fn=respond,
+        inputs=[msg, chatbot, mode_select],
+        outputs=[msg, chatbot]
+    )
+    
+    # Save chat history
+    save_btn.click(
+        fn=save_chat,
+        inputs=[chatbot],
+        outputs=[save_status]
+    )
+    
+    # Clear all
+    clear_btn.click(
+        fn=clear_all,
+        outputs=[pdf_upload, upload_status, doc_info, chatbot, save_status]
+    )
+
+# Step 9: Launch the application
+print("\n" + "="*60)
+print("🚀 Launching PDF Q&A Assistant...")
+print("="*60 + "\n")
+
+demo.launch(share=True, debug=True)
