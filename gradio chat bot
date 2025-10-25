@@ -1,315 +1,624 @@
-# PDF Q&A Chatbot with Gradio
-# A document assistant that answers questions about uploaded PDFs
+# @title
+"""
+Professional RAG Document Q&A System
+======================================
+A production-ready Retrieval-Augmented Generation chatbot with:
+- Multi-document PDF processing with OCR support
+- Semantic search using sentence-transformers
+- FAISS vector database
+- Open-source LLM (HuggingFace)
+- Source citations and confidence scores
+- Modern Gradio UI
 
-# Step 1: Uninstall and reinstall Gradio cleanly
-!pip uninstall gradio -y -q
-!pip install gradio==4.36.1 pypdf2 -q
+Author: [Ronald]
+"""
 
+# ============================================================================
+# INSTALLATION - Run this cell first
+# ============================================================================
+!pip install -q gradio pypdf2 sentence-transformers faiss-cpu transformers pytesseract pillow pdf2image torch
 
-# PDF Q&A Chatbot with Gradio
-# Built following official Gradio chatbot documentation
+# For OCR support in Colab
+!apt-get install -y tesseract-ocr poppler-utils > /dev/null 2>&1
 
-# Step 1: Install required packages
-!pip install gradio pypdf2 -q
+print("✅ All dependencies installed successfully!")
 
-# Step 2: Import libraries
+# ============================================================================
+# IMPORTS
+# ============================================================================
 import gradio as gr
 import PyPDF2
 import io
+import numpy as np
 from datetime import datetime
+from typing import List, Tuple, Dict
 import json
+import re
 
-print("✅ Libraries loaded successfully!")
+# ML/NLP Libraries
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
 
-# Step 3: Global variable to store PDF content
-pdf_text_content = ""
+# OCR Libraries
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except:
+    OCR_AVAILABLE = False
+    print("⚠️ OCR not available")
 
-# Step 4: PDF Processing Function
-def process_pdf_upload(pdf_file):
-    """Process uploaded PDF and extract text"""
-    global pdf_text_content
-    
-    if pdf_file is None:
-        return "📤 No file uploaded", "0 pages"
-    
-    try:
-        # Read PDF from binary data
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_file))
-        
-        # Extract text from all pages
-        pdf_text_content = ""
-        for page in pdf_reader.pages:
-            pdf_text_content += page.extract_text() + "\n"
-        
-        # Get statistics
-        num_pages = len(pdf_reader.pages)
-        num_words = len(pdf_text_content.split())
-        
-        status = f"✅ Loaded: {num_pages} pages, ~{num_words} words"
-        info = f"{num_pages} pages | {num_words} words"
-        
-        return status, info
-        
-    except Exception as e:
-        pdf_text_content = ""
-        return f"❌ Error: {str(e)}", "Error"
+print("✅ Libraries imported successfully!")
 
-# Step 5: Chat Response Function (following Gradio chatbot pattern)
-def respond(message, chat_history, response_mode):
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+class RAGConfig:
+    """Configuration for the RAG system - OPTIMIZED FOR SPEED"""
+    EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # Fast & lightweight
+    LLM_MODEL = "google/flan-t5-small"  # CHANGED: Smaller = 3x faster
+    CHUNK_SIZE = 400  # OPTIMIZED: Smaller chunks = faster processing
+    CHUNK_OVERLAP = 30  # OPTIMIZED: Less overlap = fewer chunks
+    TOP_K_RETRIEVAL = 3
+    TEMPERATURE = 0.7
+    MAX_NEW_TOKENS = 150  # OPTIMIZED: Shorter responses = faster generation
+    BATCH_SIZE = 32  # NEW: Batch processing for embeddings
+
+config = RAGConfig()
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+class DocumentStore:
+    """Global state management for documents and embeddings"""
+    def __init__(self):
+        self.documents = []  # List of document chunks
+        self.embeddings = None  # FAISS index
+        self.metadata = []  # Metadata for each chunk
+        self.embedding_model = None
+        self.llm_pipeline = None
+        self.index = None
+
+    def clear(self):
+        """Reset all stored data"""
+        self.documents = []
+        self.embeddings = None
+        self.metadata = []
+        self.index = None
+
+store = DocumentStore()
+
+# ============================================================================
+# DOCUMENT PROCESSING FUNCTIONS
+# ============================================================================
+
+def extract_text_from_pdf(pdf_bytes: bytes, use_ocr: bool = False) -> Tuple[str, Dict]:
     """
-    Generate response to user message
-    This follows the official Gradio chatbot pattern
+    Extract text from PDF with optional OCR for scanned documents
+    Returns: (extracted_text, metadata)
     """
-    global pdf_text_content
-    
-    # Check if PDF is loaded
-    if not pdf_text_content or pdf_text_content.strip() == "":
-        bot_message = "⚠️ Please upload a PDF document first before asking questions!"
-        chat_history.append((message, bot_message))
-        return "", chat_history
-    
-    # Check for empty message
-    if not message or message.strip() == "":
-        return "", chat_history
-    
-    # Process based on response mode
-    message_lower = message.lower()
-    
-    if response_mode == "Summary":
-        # Return document summary
-        words = pdf_text_content.split()
-        summary_length = min(200, len(words))
-        summary = ' '.join(words[:summary_length])
-        if len(words) > 200:
-            summary += "..."
-        bot_message = f"📄 **Document Summary:**\n\n{summary}"
-    
-    elif response_mode == "Detailed":
-        # Search for detailed relevant sections
-        sentences = [s.strip() for s in pdf_text_content.split('.') if s.strip() and len(s.strip()) > 20]
-        keywords = [w for w in message_lower.split() if len(w) > 3]
-        
-        relevant_sentences = []
-        for sentence in sentences:
-            if any(keyword in sentence.lower() for keyword in keywords):
-                relevant_sentences.append(sentence)
-        
-        if relevant_sentences:
-            detailed_response = '. '.join(relevant_sentences[:5])
-            if not detailed_response.endswith('.'):
-                detailed_response += '.'
-            bot_message = f"🔍 **Detailed Answer:**\n\n{detailed_response}"
-        else:
-            bot_message = "🔍 I couldn't find detailed information about that. Try:\n• Using different keywords\n• Asking a broader question\n• Switching to 'Summary' mode"
-    
-    else:  # Simple mode
-        # Quick answer with first relevant sentence
-        sentences = [s.strip() for s in pdf_text_content.split('.') if s.strip() and len(s.strip()) > 20]
-        keywords = [w for w in message_lower.split() if len(w) > 3]
-        
-        relevant_sentences = []
-        for sentence in sentences:
-            if any(keyword in sentence.lower() for keyword in keywords):
-                relevant_sentences.append(sentence)
-        
-        if relevant_sentences:
-            bot_message = f"💡 {relevant_sentences[0]}."
-        else:
-            bot_message = "💡 I couldn't find that specific information. Try:\n• Different keywords\n• More general questions\n• 'Summary' mode for an overview"
-    
-    # Add timestamp
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    bot_message += f"\n\n*Answered at {timestamp}*"
-    
-    # Append to chat history (message, response) tuple format
-    chat_history.append((message, bot_message))
-    
-    # Return empty string for textbox (clears it) and updated history
-    return "", chat_history
-
-# Step 6: Save Chat History Function
-def save_chat(chat_history):
-    """Save conversation to JSON file"""
-    if not chat_history or len(chat_history) == 0:
-        return "⚠️ No chat history to save"
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"chat_history_{timestamp}.json"
-    
-    conversation_data = {
-        "saved_at": datetime.now().isoformat(),
-        "total_messages": len(chat_history),
-        "conversation": [
-            {"question": user_msg, "answer": bot_msg} 
-            for user_msg, bot_msg in chat_history
-        ]
+    metadata = {
+        "total_pages": 0,
+        "extraction_method": "digital",
+        "timestamp": datetime.now().isoformat()
     }
-    
+
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(conversation_data, f, indent=2, ensure_ascii=False)
-        return f"💾 Chat saved to: {filename}"
+        # Try digital extraction first
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        metadata["total_pages"] = len(pdf_reader.pages)
+
+        text = ""
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            text += f"\n[Page {page_num + 1}]\n{page_text}"
+
+        # If text is too short, it might be scanned - try OCR
+        if len(text.strip()) < 100 and use_ocr and OCR_AVAILABLE:
+            print("📸 Text extraction yielded minimal content, attempting OCR...")
+            metadata["extraction_method"] = "ocr"
+            text = extract_text_with_ocr(pdf_bytes)
+
+        return text, metadata
+
     except Exception as e:
-        return f"❌ Error saving: {str(e)}"
+        return f"Error: {str(e)}", metadata
 
-# Step 7: Clear All Function
-def clear_all():
-    """Reset everything"""
-    global pdf_text_content
-    pdf_text_content = ""
-    return None, "📤 Ready for new document", "0 pages", [], ""
+def extract_text_with_ocr(pdf_bytes: bytes) -> str:
+    """Extract text using OCR for scanned PDFs"""
+    try:
+        # Convert PDF to images
+        images = convert_from_bytes(pdf_bytes)
 
-# Step 8: Build Gradio Interface using Blocks
-with gr.Blocks(theme=gr.themes.Soft(), title="PDF Q&A Assistant") as demo:
-    
-    gr.Markdown("""
-    # 📚 PDF Question & Answer Assistant
-    ### Upload a PDF document and ask questions about its content!
-    """)
-    
-    with gr.Row():
-        # Left Column - Upload and Controls
-        with gr.Column(scale=1):
-            gr.Markdown("### 📤 Document Upload")
-            
-            pdf_upload = gr.File(
-                label="Choose PDF File",
-                file_types=[".pdf"],
-                type="binary"
-            )
-            
-            upload_status = gr.Textbox(
-                label="Upload Status",
-                value="📤 Waiting for document...",
-                interactive=False
-            )
-            
-            doc_info = gr.Textbox(
-                label="Document Info",
-                value="0 pages",
-                interactive=False
-            )
-            
-            gr.Markdown("### ⚙️ Response Settings")
-            
-            mode_select = gr.Dropdown(
-                choices=["Simple", "Detailed", "Summary"],
-                value="Simple",
-                label="Response Mode",
-                info="Choose answer detail level"
-            )
-            
-            gr.Markdown("""
-            **Mode Guide:**
-            - **Simple**: Quick, direct answers
-            - **Detailed**: Comprehensive responses  
-            - **Summary**: Document overview
-            """)
-            
-            gr.Markdown("### 🛠️ Actions")
-            
-            with gr.Row():
-                clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
-                save_btn = gr.Button("💾 Save Chat", variant="primary")
-            
-            save_status = gr.Textbox(
-                label="Save Status",
-                interactive=False
-            )
-        
-        # Right Column - Chat Interface
-        with gr.Column(scale=2):
-            gr.Markdown("### 💬 Chat Interface")
-            
-            # Chatbot component (main chat display)
-            chatbot = gr.Chatbot(
-                label="Conversation",
-                height=450,
-                show_copy_button=True
-            )
-            
-            # Message input textbox
-            msg = gr.Textbox(
-                label="Your Question",
-                placeholder="Type your question here...",
-                lines=2,
-                show_label=True
-            )
-            
-            # Submit button
-            submit_btn = gr.Button("🚀 Ask Question", variant="primary")
-    
-    # Example Questions
-    gr.Markdown("### 💡 Example Questions")
-    gr.Examples(
-        examples=[
-            ["What is this document about?"],
-            ["Can you summarize the main points?"],
-            ["What are the key findings?"],
-            ["Tell me about the introduction"],
-            ["What methodology was used?"]
-        ],
-        inputs=msg
-    )
-    
-    # Footer
-    gr.Markdown("""
-    ---
-    ### 📌 Key Features:
-    
-    | Feature | Description |
-    |---------|-------------|
-    | 🔄 **Response Modes** | Simple, Detailed, or Summary answers |
-    | 📁 **PDF Support** | Upload and analyze any PDF document |
-    | 💾 **Save History** | Export conversations to JSON |
-    | 🎨 **Modern UI** | Clean, intuitive interface |
-    | ⌨️ **Shortcuts** | Press Enter to submit |
-    | 🕒 **Timestamps** | Track when answers were generated |
-    | 📋 **Copy Button** | Easily copy responses |
-    
-    ---
-    *Built with Gradio | Powered by PyPDF2*
-    """)
-    
-    # Event Handlers (following Gradio chatbot pattern)
-    
-    # File upload handler
-    pdf_upload.change(
-        fn=process_pdf_upload,
-        inputs=[pdf_upload],
-        outputs=[upload_status, doc_info]
-    )
-    
-    # Submit button click - uses respond function
-    submit_btn.click(
-        fn=respond,
-        inputs=[msg, chatbot, mode_select],
-        outputs=[msg, chatbot]
-    )
-    
-    # Enter key press - uses respond function
-    msg.submit(
-        fn=respond,
-        inputs=[msg, chatbot, mode_select],
-        outputs=[msg, chatbot]
-    )
-    
-    # Save chat history
-    save_btn.click(
-        fn=save_chat,
-        inputs=[chatbot],
-        outputs=[save_status]
-    )
-    
-    # Clear all
-    clear_btn.click(
-        fn=clear_all,
-        outputs=[pdf_upload, upload_status, doc_info, chatbot, save_status]
-    )
+        text = ""
+        for i, image in enumerate(images):
+            page_text = pytesseract.image_to_string(image)
+            text += f"\n[Page {i + 1}]\n{page_text}"
 
-# Step 9: Launch the application
-print("\n" + "="*60)
-print("🚀 Launching PDF Q&A Assistant...")
-print("="*60 + "\n")
+        return text
+    except Exception as e:
+        return f"OCR Error: {str(e)}"
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """
+    Split text into overlapping chunks for better context preservation
+    """
+    words = text.split()
+    chunks = []
+
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+
+    return chunks
+
+def create_metadata_for_chunks(chunks: List[str], doc_metadata: Dict, filename: str) -> List[Dict]:
+    """
+    Create metadata for each chunk including source tracking
+    """
+    metadata_list = []
+
+    for idx, chunk in enumerate(chunks):
+        # Extract page number from chunk if available
+        page_match = re.search(r'\[Page (\d+)\]', chunk)
+        page_num = int(page_match.group(1)) if page_match else None
+
+        metadata_list.append({
+            "chunk_id": idx,
+            "source_file": filename,
+            "page_number": page_num,
+            "chunk_length": len(chunk),
+            "extraction_method": doc_metadata.get("extraction_method", "digital"),
+            "timestamp": doc_metadata.get("timestamp")
+        })
+
+    return metadata_list
+
+# ============================================================================
+# EMBEDDING & INDEXING FUNCTIONS
+# ============================================================================
+
+def initialize_models():
+    """Load embedding model and LLM"""
+    global store
+
+    if store.embedding_model is None:
+        print("🔄 Loading embedding model...")
+        store.embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+        print("✅ Embedding model loaded")
+
+    if store.llm_pipeline is None:
+        print("🔄 Loading language model...")
+        tokenizer = AutoTokenizer.from_pretrained(config.LLM_MODEL)
+        model = AutoModelForSeq2SeqLM.from_pretrained(config.LLM_MODEL)
+        store.llm_pipeline = pipeline(
+            "text2text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=config.MAX_NEW_TOKENS,
+            device=0 if torch.cuda.is_available() else -1
+        )
+        print("✅ Language model loaded")
+
+def create_embeddings(texts: List[str]) -> np.ndarray:
+    """Generate embeddings for text chunks"""
+    return store.embedding_model.encode(texts, show_progress_bar=True)
+
+def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
+    """Create FAISS index for similarity search"""
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)  # L2 distance
+    index.add(embeddings.astype('float32'))
+    return index
+
+# ============================================================================
+# RETRIEVAL FUNCTIONS
+# ============================================================================
+
+def retrieve_relevant_chunks(query: str, top_k: int = 3) -> List[Tuple[str, float, Dict]]:
+    """
+    Retrieve most relevant chunks for a query
+    Returns: List of (chunk_text, confidence_score, metadata)
+    """
+    if store.index is None or len(store.documents) == 0:
+        return []
+
+    # Encode query
+    query_embedding = store.embedding_model.encode([query])
+
+    # Search in FAISS index
+    distances, indices = store.index.search(query_embedding.astype('float32'), top_k)
+
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < len(store.documents):
+            # Convert distance to confidence score (0-1)
+            confidence = 1 / (1 + dist)
+            results.append((
+                store.documents[idx],
+                float(confidence),
+                store.metadata[idx]
+            ))
+
+    return results
+
+# ============================================================================
+# PROMPT ENGINEERING
+# ============================================================================
+
+def build_rag_prompt(query: str, context_chunks: List[Tuple[str, float, Dict]]) -> str:
+    """
+    Build optimized prompt with retrieved context
+    """
+    context_text = ""
+
+    for i, (chunk, score, metadata) in enumerate(context_chunks, 1):
+        source = f"[Source: {metadata['source_file']}, Page {metadata['page_number']}]" if metadata['page_number'] else f"[Source: {metadata['source_file']}]"
+        context_text += f"\nContext {i} {source}:\n{chunk}\n"
+
+    prompt = f"""You are a helpful assistant that answers questions based on provided documents.
+
+Instructions:
+- Answer the question using ONLY the information from the contexts below
+- If the answer is not in the contexts, say "I cannot find this information in the provided documents"
+- Cite your sources by mentioning the source file and page number
+- Be concise and accurate
+
+{context_text}
+
+Question: {query}
+
+Answer:"""
+
+    return prompt
+
+# ============================================================================
+# GENERATION FUNCTION
+# ============================================================================
+
+def generate_answer(query: str, top_k: int = 3) -> Tuple[str, List[Dict]]:
+    """
+    Full RAG pipeline: Retrieve → Build Prompt → Generate
+    Returns: (answer, sources_used)
+    """
+    # Retrieve relevant chunks
+    retrieved_chunks = retrieve_relevant_chunks(query, top_k)
+
+    if not retrieved_chunks:
+        return "⚠️ No documents have been uploaded yet. Please upload PDFs first.", []
+
+    # Build prompt
+    prompt = build_rag_prompt(query, retrieved_chunks)
+
+    # Generate answer
+    response = store.llm_pipeline(prompt)[0]['generated_text']
+
+    # Prepare source information
+    sources = []
+    for chunk, confidence, metadata in retrieved_chunks:
+        sources.append({
+            "source_file": metadata["source_file"],
+            "page_number": metadata["page_number"],
+            "confidence": f"{confidence:.2%}",
+            "preview": chunk[:200] + "..." if len(chunk) > 200 else chunk
+        })
+
+    return response, sources
+
+# ============================================================================
+# DOCUMENT UPLOAD & PROCESSING
+# ============================================================================
+
+def process_uploaded_files(files, use_ocr):
+    """
+    Process uploaded PDF files and build vector index
+    """
+    if not files:
+        return "⚠️ No files uploaded", "", ""
+
+    # Initialize models if not already loaded
+    initialize_models()
+
+    # Clear previous data
+    store.clear()
+
+    status_messages = []
+    all_chunks = []
+    all_metadata = []
+
+    total_files = len(files) if isinstance(files, list) else 1
+    files_list = files if isinstance(files, list) else [files]
+
+    status_messages.append(f"📁 Processing {total_files} file(s)...\n")
+
+    for file_obj in files_list:
+        filename = file_obj.name if hasattr(file_obj, 'name') else "document.pdf"
+        status_messages.append(f"\n📄 Processing: {filename}")
+
+        # Read file bytes
+        if isinstance(file_obj, bytes):
+            pdf_bytes = file_obj
+        else:
+            pdf_bytes = file_obj
+
+        # Extract text
+        text, doc_metadata = extract_text_from_pdf(pdf_bytes, use_ocr)
+
+        if text.startswith("Error"):
+            status_messages.append(f"  ❌ {text}")
+            continue
+
+        # Chunk text
+        chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+        status_messages.append(f"  ✅ Extracted {doc_metadata['total_pages']} pages → {len(chunks)} chunks")
+
+        # Create metadata
+        chunk_metadata = create_metadata_for_chunks(chunks, doc_metadata, filename)
+
+        all_chunks.extend(chunks)
+        all_metadata.extend(chunk_metadata)
+
+    if not all_chunks:
+        return "\n".join(status_messages) + "\n\n❌ No content extracted", "", ""
+
+    # Store chunks
+    store.documents = all_chunks
+    store.metadata = all_metadata
+
+    # Create embeddings
+    status_messages.append(f"\n🔄 Creating embeddings for {len(all_chunks)} chunks...")
+    embeddings = create_embeddings(all_chunks)
+
+    # Build FAISS index
+    status_messages.append("🔄 Building vector index...")
+    store.index = build_faiss_index(embeddings)
+
+    status_messages.append(f"\n✅ System ready! Indexed {len(all_chunks)} chunks from {total_files} document(s)")
+
+    # Generate statistics
+    stats = f"""📊 **Processing Summary:**
+- Total Documents: {total_files}
+- Total Chunks: {len(all_chunks)}
+- Average Chunk Size: {np.mean([len(c) for c in all_chunks]):.0f} characters
+- Embedding Dimension: {embeddings.shape[1]}
+- Index Size: {len(store.documents)} vectors
+"""
+
+    doc_info = f"""📁 **Document Details:**
+"""
+    for meta in all_metadata[:5]:  # Show first 5
+        doc_info += f"\n• {meta['source_file']} (Page {meta['page_number']}): {meta['chunk_length']} chars"
+
+    if len(all_metadata) > 5:
+        doc_info += f"\n• ... and {len(all_metadata) - 5} more chunks"
+
+    return "\n".join(status_messages), stats, doc_info
+
+# ============================================================================
+# CHAT INTERFACE FUNCTIONS
+# ============================================================================
+
+def chat_response(message, history, top_k):
+    """
+    Handle chat messages with RAG pipeline
+    """
+    if not message or not message.strip():
+        return history, ""
+
+    if not store.documents:
+        response = "⚠️ Please upload and process documents first before asking questions."
+        history.append((message, response))
+        return history, ""
+
+    # Generate answer with sources
+    answer, sources = generate_answer(message, top_k)
+
+    # Format response with sources
+    formatted_response = f"{answer}\n\n"
+
+    if sources:
+        formatted_response += "📚 **Sources:**\n"
+        for i, source in enumerate(sources, 1):
+            formatted_response += f"{i}. {source['source_file']}"
+            if source['page_number']:
+                formatted_response += f" (Page {source['page_number']})"
+            formatted_response += f" - Confidence: {source['confidence']}\n"
+
+    formatted_response += f"\n*Retrieved from {len(sources)} chunks • {datetime.now().strftime('%H:%M:%S')}*"
+
+    history.append((message, formatted_response))
+    return history, ""
+
+def export_chat_history(history):
+    """Export chat history to JSON"""
+    if not history:
+        return "⚠️ No chat history to export"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"rag_chat_history_{timestamp}.json"
+
+    data = {
+        "exported_at": datetime.now().isoformat(),
+        "total_exchanges": len(history),
+        "conversation": [{"question": q, "answer": a} for q, a in history]
+    }
+
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    return f"💾 Exported to {filename}"
+
+# ============================================================================
+# GRADIO UI
+# ============================================================================
+
+def build_ui():
+    """Build the complete Gradio interface"""
+
+    with gr.Blocks(theme=gr.themes.Soft(), title="RAG Document Q&A System") as app:
+
+        gr.Markdown("""
+        # 🚀 Professional RAG Document Q&A System
+        ### Retrieval-Augmented Generation with Source Citations
+
+        Upload PDFs → Ask Questions → Get Answers with Sources
+        """)
+
+        with gr.Row():
+            # LEFT COLUMN - Document Processing
+            with gr.Column(scale=1):
+                gr.Markdown("### 📤 Document Upload & Processing")
+
+                file_upload = gr.File(
+                    label="Upload PDF Documents",
+                    file_types=[".pdf"],
+                    file_count="multiple",
+                    type="binary"
+                )
+
+                ocr_checkbox = gr.Checkbox(
+                    label="Enable OCR for scanned documents",
+                    value=False,
+                    info="Slower but handles scanned PDFs"
+                )
+
+                process_btn = gr.Button("🔄 Process Documents", variant="primary", size="lg")
+
+                processing_status = gr.Textbox(
+                    label="Processing Status",
+                    lines=8,
+                    interactive=False
+                )
+
+                gr.Markdown("### 📊 System Statistics")
+
+                stats_display = gr.Textbox(
+                    label="Statistics",
+                    lines=6,
+                    interactive=False
+                )
+
+                doc_details = gr.Textbox(
+                    label="Document Details",
+                    lines=6,
+                    interactive=False
+                )
+
+                gr.Markdown("### ⚙️ Retrieval Settings")
+
+                top_k_slider = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=3,
+                    step=1,
+                    label="Number of chunks to retrieve",
+                    info="More chunks = more context but slower"
+                )
+
+            # RIGHT COLUMN - Chat Interface
+            with gr.Column(scale=2):
+                gr.Markdown("### 💬 Ask Questions")
+
+                chatbot = gr.Chatbot(
+                    label="Conversation",
+                    height=500,
+                    show_copy_button=True
+                )
+
+                with gr.Row():
+                    msg_input = gr.Textbox(
+                        label="Your Question",
+                        placeholder="Ask anything about your documents...",
+                        lines=2,
+                        scale=4
+                    )
+                    send_btn = gr.Button("🚀 Send", variant="primary", scale=1)
+
+                with gr.Row():
+                    clear_btn = gr.Button("🗑️ Clear Chat", variant="secondary")
+                    export_btn = gr.Button("💾 Export History", variant="secondary")
+
+                export_status = gr.Textbox(label="Export Status", interactive=False)
+
+        # Example Questions
+        gr.Markdown("### 💡 Example Questions")
+        gr.Examples(
+            examples=[
+                ["What are the main topics discussed in the document?"],
+                ["Summarize the key findings"],
+                ["What conclusions were drawn?"],
+                ["Are there any recommendations mentioned?"],
+                ["What methodology was used?"]
+            ],
+            inputs=msg_input
+        )
+
+        # Footer
+        gr.Markdown("""
+        ---
+        ### 🎯 **System Features:**
+
+        | Component | Technology |
+        |-----------|------------|
+        | **Embeddings** | sentence-transformers/all-MiniLM-L6-v2 |
+        | **Vector Store** | FAISS (Facebook AI Similarity Search) |
+        | **LLM** | Google FLAN-T5 (Open Source) |
+        | **OCR** | Tesseract (Optional) |
+        | **Framework** | Gradio + PyTorch |
+
+        **Key Capabilities:**
+        ✅ Multi-document processing • ✅ OCR for scanned PDFs • ✅ Semantic search • ✅ Source citations • ✅ Confidence scores • ✅ Metadata tracking
+
+        ---
+        *Built with ❤️ using open-source technologies*
+        """)
+
+        # Event Handlers
+        process_btn.click(
+            fn=process_uploaded_files,
+            inputs=[file_upload, ocr_checkbox],
+            outputs=[processing_status, stats_display, doc_details]
+        )
+
+        send_btn.click(
+            fn=chat_response,
+            inputs=[msg_input, chatbot, top_k_slider],
+            outputs=[chatbot, msg_input]
+        )
+
+        msg_input.submit(
+            fn=chat_response,
+            inputs=[msg_input, chatbot, top_k_slider],
+            outputs=[chatbot, msg_input]
+        )
+
+        clear_btn.click(
+            fn=lambda: [],
+            outputs=[chatbot]
+        )
+
+        export_btn.click(
+            fn=export_chat_history,
+            inputs=[chatbot],
+            outputs=[export_status]
+        )
+
+    return app
+
+# ============================================================================
+# LAUNCH
+# ============================================================================
+
+print("\n" + "="*70)
+print("🚀 Initializing Professional RAG System...")
+print("="*70)
+
+demo = build_ui()
+
+print("\n✅ System ready to launch!")
+print("📝 Upload PDFs → Process → Ask Questions → Get Cited Answers\n")
 
 demo.launch(share=True, debug=True)
