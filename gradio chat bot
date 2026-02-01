@@ -59,9 +59,9 @@ class RAGConfig:
     """Configuration for the RAG system - OPTIMIZED FOR SPEED"""
     EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # Fast & lightweight
     LLM_MODEL = "google/flan-t5-large"  # Better quality than small
-    CHUNK_SIZE = 400  # OPTIMIZED: Smaller chunks = faster processing
-    CHUNK_OVERLAP = 30  # OPTIMIZED: Less overlap = fewer chunks
-    TOP_K_RETRIEVAL = 3
+    CHUNK_SIZE = 200  # OPTIMIZED: Smaller chunks = faster processing
+    CHUNK_OVERLAP = 20  # OPTIMIZED: Less overlap = fewer chunks
+    TOP_K_RETRIEVAL = 2
     TEMPERATURE = 0.7
     MAX_NEW_TOKENS = 150  # OPTIMIZED: Shorter responses = faster generation
     BATCH_SIZE = 32  # NEW: Batch processing for embeddings
